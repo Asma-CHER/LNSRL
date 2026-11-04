@@ -1,9 +1,14 @@
-# LNS-RL for the Capacitated Vehicle Routing Problem
+# LNS-RL-KES Optimized
 
 This repository contains the implementation, trained policy, benchmark data,
 and evaluation results used for the LNS-RL experiments reported at KES 2025.
 LNS-RL combines Large Neighbourhood Search (LNS) with a reinforcement-learning
 policy that selects the customers removed at each search iteration.
+
+This optimized edition preserves the published model and search logic while
+removing the main runtime bottlenecks of the original research implementation.
+In particular, one persistent Java repair worker is reused throughout the
+search instead of starting a new JVM and exchanging files at every iteration.
 
 The release supports Capacitated Vehicle Routing Problem (CVRP) instances in
 CVRPLIB format with fewer than 200 customers.
@@ -17,6 +22,7 @@ CVRPLIB format with fewer than 200 customers.
 - the trained 11-feature LNS-RL policy used in the paper;
 - 41 CMT, tai, and X benchmark instances with reference solutions;
 - a command-line solver for evaluating individual CVRP instances;
+- an optimized persistent Java/Python execution pipeline;
 - the original KES 2025 results workbook and CSV exports; and
 - an integrity checker for the published research artifacts.
 
@@ -29,8 +35,7 @@ CVRPLIB format with fewer than 200 customers.
 Create an isolated Python environment and install the dependencies:
 
 ```bash
-git clone https://github.com/Asma-CHER/LNSRL.git
-cd LNSRL
+cd LNS-RL-KES-Optimized
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -88,6 +93,7 @@ also reports the reference cost and the percentage gap.
 | `--initial-temperature` | Initial simulated-annealing temperature | `100` |
 | `--final-temperature` | Final simulated-annealing temperature | `1` |
 | `--seed` | NumPy and PyTorch random seed | `0` |
+| `--torch-threads` | CPU threads used by PyTorch | `1` |
 | `--device` | PyTorch device, such as `cpu`, `cuda`, or `cuda:0` | Auto-detected |
 | `--output` | Destination for the JSON result | `results/generated/solution.json` |
 | `--animation` | Optional destination for a GIF of the best route during search | None |
@@ -105,6 +111,23 @@ and model identifier. When a reference solution is provided, it also includes
 When `--animation` is supplied, the solver also creates an animated GIF showing
 how the best-known routes evolve over the sampled search iterations. Animation
 generation is optional and does not change the search decisions.
+
+## Runtime optimization
+
+The optimized runner:
+
+- starts one Java repair worker per solve rather than one JVM per iteration;
+- loads the instance and distance matrix into Java only once;
+- exchanges repair requests through buffered standard input/output;
+- avoids temporary state files inside the iteration loop;
+- sends the graph directly to the policy without constructing a one-item
+  `DataLoader` at every iteration;
+- caches the static neighbourhood edge tensor; and
+- recompiles Java sources only when they have changed.
+
+The trained checkpoint, neural-network architecture, features, destroy/repair
+operators, acceptance criterion, and paper defaults are unchanged. See
+[OPTIMIZATION.md](OPTIMIZATION.md) for validation and benchmark details.
 
 ## Paper evaluation protocol
 
@@ -147,9 +170,10 @@ they are not solver parameters.
 ```text
 .
 ├── solve.py                      # Single-instance evaluation entry point
+├── OPTIMIZATION.md               # Optimization design and validation
 ├── verify_release.py             # Research-artifact integrity checks
 ├── lib/                          # LNS-RL policy and CVRP environment
-├── JAVA/                         # Initialization, SISR, and repair operators
+├── JAVA/                         # Repair operators and persistent worker
 ├── models/lns_rl_kes.pth         # Trained policy used in the paper
 ├── data/paper_instances/         # 41 benchmark instances
 ├── data/paper_solutions/         # Corresponding reference solutions

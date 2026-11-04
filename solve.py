@@ -8,7 +8,6 @@ import copy
 import hashlib
 import json
 import math
-import os
 import re
 import subprocess
 import tempfile
@@ -17,7 +16,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
 
 from lib.ppo_1 import Agent
 from lib.search_animation import save_search_animation
@@ -39,9 +37,11 @@ def _write_distances(matrix: np.ndarray, path: Path) -> None:
     path.write_text(line + "\n")
 
 
-def _write_state(capacity: float, ruins: list[int], routes: list[list[int]], path: Path) -> None:
+def _serialize_state(
+    capacity: float, ruins: list[int], routes: list[list[int]]
+) -> str:
     route_text = ";".join(",".join(map(str, route)) for route in routes)
-    path.write_text(f"{capacity}:{','.join(map(str, ruins))}:{route_text}\n")
+    return f"{capacity}:{','.join(map(str, ruins))}:{route_text}"
 
 
 def _parse_java_output(output: str) -> tuple[float, list[list[int]]]:
@@ -66,7 +66,14 @@ def _compile_java() -> None:
         java_dir / "RandomSolver.java",
         java_dir / "SISRSolver.java",
         java_dir / "Recreate.java",
+        java_dir / "RepairWorker.java",
     ]
+    class_files = [java_dir / f"{source.stem}.class" for source in sources]
+    if all(path.exists() for path in class_files):
+        newest_source = max(path.stat().st_mtime_ns for path in sources)
+        oldest_class = min(path.stat().st_mtime_ns for path in class_files)
+        if oldest_class >= newest_source:
+            return
     subprocess.run(
         ["javac", "-classpath", str(java_dir), *(str(path) for path in sources)],
         check=True,
@@ -83,6 +90,75 @@ def _run_java(class_name: str, *arguments: object) -> str:
     return completed.stdout
 
 
+class _RepairWorker:
+    """Long-lived Java process for the unchanged regret-repair operator."""
+
+    def __init__(self, data_path: Path, distance_path: Path) -> None:
+        self.process = subprocess.Popen(
+            [
+                "java",
+                "-classpath",
+                str(ROOT / "JAVA"),
+                "RepairWorker",
+                str(data_path),
+                str(distance_path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+    def repair(
+        self, capacity: float, ruins: list[int], routes: list[list[int]]
+    ) -> tuple[float, list[list[int]]]:
+        if self.process.stdin is None or self.process.stdout is None:
+            raise RuntimeError("Java repair worker has no communication pipes")
+        request = _serialize_state(capacity, ruins, routes)
+        try:
+            self.process.stdin.write(request + "\n")
+            self.process.stdin.flush()
+        except BrokenPipeError as error:
+            raise RuntimeError(self._failure_message()) from error
+
+        response = self.process.stdout.readline()
+        if not response:
+            raise RuntimeError(self._failure_message())
+        if response.startswith("ERROR:"):
+            raise RuntimeError(f"Java repair worker failed: {response.strip()}")
+        return _parse_java_output(response)
+
+    def _failure_message(self) -> str:
+        details = ""
+        if self.process.poll() is not None and self.process.stderr is not None:
+            details = self.process.stderr.read().strip()
+        message = "Java repair worker stopped unexpectedly"
+        return f"{message}: {details}" if details else message
+
+    def close(self) -> None:
+        if self.process.poll() is not None:
+            return
+        if self.process.stdin is not None:
+            try:
+                self.process.stdin.write("QUIT\n")
+                self.process.stdin.flush()
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.terminate()
+            self.process.wait(timeout=5)
+
+    def __enter__(self) -> _RepairWorker:
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self.close()
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -92,6 +168,7 @@ def _sha256(path: Path) -> str:
 
 
 def solve(args: argparse.Namespace) -> dict:
+    torch.set_num_threads(args.torch_threads)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -122,7 +199,6 @@ def solve(args: argparse.Namespace) -> dict:
     with tempfile.TemporaryDirectory(prefix="lns_rl_kes_") as temp_name:
         temp_dir = Path(temp_name)
         data_path = temp_dir / "data_0.txt"
-        state_path = temp_dir / "state.txt"
         distance_path = temp_dir / "distances.txt"
         _write_array(instance_data, data_path)
 
@@ -163,7 +239,9 @@ def solve(args: argparse.Namespace) -> dict:
         agent.load(str(checkpoint))
         agent.policy_old.eval()
 
-        edge_near = build_edge_index_near([distance_matrix], 10)[0]
+        edge_near = torch.from_numpy(
+            build_edge_index_near([distance_matrix], 10)[0]
+        ).long().to(device)
         hidden = torch.zeros((1, 128), dtype=torch.float32, device=device)
         previous_input = torch.zeros(
             (1, n_ruins_total, 11), dtype=torch.float32, device=device
@@ -172,65 +250,67 @@ def solve(args: argparse.Namespace) -> dict:
         accepted_moves = 0
         improving_moves = 0
 
-        for step in range(args.iterations):
-            embedding = environment.get_embedding_cvrp_metrics()
-            if step:
-                previous_input = torch.from_numpy(
-                    (embedding[previous_ruins] * float(was_accepted)).astype(np.float32)
-                ).unsqueeze(0).to(device)
+        with _RepairWorker(data_path, distance_path) as repair_worker:
+            for step in range(args.iterations):
+                embedding = environment.get_embedding_cvrp_metrics()
+                if step:
+                    previous_input = torch.from_numpy(
+                        (embedding[previous_ruins] * float(was_accepted)).astype(np.float32)
+                    ).unsqueeze(0).to(device)
 
-            graph = Data(
-                x=torch.from_numpy(embedding).float().to(device),
-                edge_index_r0=torch.from_numpy(
-                    build_edge_index_routes([environment.curr_routes], inverse=False)[0]
-                ).long().to(device),
-                edge_index_r1=torch.from_numpy(
-                    build_edge_index_routes([environment.curr_routes], inverse=True)[0]
-                ).long().to(device),
-                edge_index_n=torch.from_numpy(edge_near).long().to(device),
-                state_=hidden[0],
-                input_=previous_input[0],
-            )
-            batch = next(iter(DataLoader([graph], batch_size=1, shuffle=False)))
-            with torch.no_grad():
-                hidden, action_node, action_sisr, _node_dist, _sisr_dist = agent.policy_old.act(
-                    batch, n_nodes
+                graph = Data(
+                    x=torch.from_numpy(embedding).float().to(device),
+                    edge_index_r0=torch.from_numpy(
+                        build_edge_index_routes(
+                            [environment.curr_routes], inverse=False
+                        )[0]
+                    ).long().to(device),
+                    edge_index_r1=torch.from_numpy(
+                        build_edge_index_routes(
+                            [environment.curr_routes], inverse=True
+                        )[0]
+                    ).long().to(device),
+                    edge_index_n=edge_near,
+                    state_=hidden[0],
+                    input_=previous_input[0],
                 )
-
-            coefficients = action_sisr[0, action_node[0]].detach().cpu().numpy()
-            previous_ruins = []
-            for anchor_index in range(args.anchors):
-                anchor = int(action_node[0, anchor_index].item()) + 1
-                selected = environment.get_ruins(
-                    anchor,
-                    float(coefficients[anchor_index]),
-                    n_ruins,
-                    ruined=previous_ruins,
-                )
-                previous_ruins.extend(selected)
-
-            _write_state(capacity, previous_ruins, environment.curr_routes, state_path)
-            recreated = _run_java(
-                "Recreate", str(temp_dir) + os.sep, state_path, distance_path
-            )
-            new_distance, new_routes = _parse_java_output(recreated)
-            was_accepted, was_improving, _reward = environment.sim_annealing(
-                new_distance, new_routes
-            )
-            accepted_moves += int(was_accepted)
-            improving_moves += int(was_improving)
-            completed_iterations = step + 1
-            if args.animation and (
-                completed_iterations % animation_every == 0
-                or completed_iterations == args.iterations
-            ):
-                snapshots.append(
-                    (
-                        completed_iterations,
-                        float(environment.best_dist),
-                        copy.deepcopy(environment.best_routes),
+                with torch.inference_mode():
+                    hidden, action_node, action_sisr, _node_dist, _sisr_dist = (
+                        agent.policy_old.act(graph, n_nodes)
                     )
+
+                coefficients = action_sisr[0, action_node[0]].detach().cpu().numpy()
+                previous_ruins = []
+                for anchor_index in range(args.anchors):
+                    anchor = int(action_node[0, anchor_index].item()) + 1
+                    selected = environment.get_ruins(
+                        anchor,
+                        float(coefficients[anchor_index]),
+                        n_ruins,
+                        ruined=previous_ruins,
+                    )
+                    previous_ruins.extend(selected)
+
+                new_distance, new_routes = repair_worker.repair(
+                    capacity, previous_ruins, environment.curr_routes
                 )
+                was_accepted, was_improving, _reward = environment.sim_annealing(
+                    new_distance, new_routes
+                )
+                accepted_moves += int(was_accepted)
+                improving_moves += int(was_improving)
+                completed_iterations = step + 1
+                if args.animation and (
+                    completed_iterations % animation_every == 0
+                    or completed_iterations == args.iterations
+                ):
+                    snapshots.append(
+                        (
+                            completed_iterations,
+                            float(environment.best_dist),
+                            copy.deepcopy(environment.best_routes),
+                        )
+                    )
 
     if args.animation:
         save_search_animation(
@@ -249,6 +329,7 @@ def solve(args: argparse.Namespace) -> dict:
         "initial_temperature": args.initial_temperature,
         "final_temperature": args.final_temperature,
         "seed": args.seed,
+        "torch_threads": args.torch_threads,
         "model": str(checkpoint),
         "model_sha256": _sha256(checkpoint),
         "initial_distance": float(initial_distance),
@@ -284,6 +365,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--torch-threads",
+        type=int,
+        default=1,
+        help="CPU threads used by PyTorch; 1 is fastest for the small paper graphs",
+    )
+    parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument("--output", default="results/generated/solution.json")
@@ -305,6 +392,8 @@ def main() -> None:
         raise ValueError("--iterations must be positive")
     if args.animation_every is not None and args.animation_every <= 0:
         raise ValueError("--animation-every must be positive")
+    if args.torch_threads <= 0:
+        raise ValueError("--torch-threads must be positive")
     result = solve(args)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
