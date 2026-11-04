@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -19,6 +20,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
 from lib.ppo_1 import Agent
+from lib.search_animation import save_search_animation
 from lib.vrp_helper_1 import get_distMat, parse_cvrp_answer, parse_cvrp_question
 from lib.vrp_helper_env import build_edge_index_near, build_edge_index_routes, vrp_env_sisr
 
@@ -128,6 +130,10 @@ def solve(args: argparse.Namespace) -> dict:
             "RandomSolver", data_path, int(capacity), 0, n_ruins_total
         )
         initial_distance, initial_routes = _parse_java_output(initial_output)
+        animation_every = args.animation_every or max(1, args.iterations // 60)
+        snapshots = [
+            (0, float(initial_distance), copy.deepcopy(initial_routes))
+        ] if args.animation else []
         distance_matrix = get_distMat(instance_data)
         _write_distances(distance_matrix, distance_path)
 
@@ -213,6 +219,26 @@ def solve(args: argparse.Namespace) -> dict:
             )
             accepted_moves += int(was_accepted)
             improving_moves += int(was_improving)
+            completed_iterations = step + 1
+            if args.animation and (
+                completed_iterations % animation_every == 0
+                or completed_iterations == args.iterations
+            ):
+                snapshots.append(
+                    (
+                        completed_iterations,
+                        float(environment.best_dist),
+                        copy.deepcopy(environment.best_routes),
+                    )
+                )
+
+    if args.animation:
+        save_search_animation(
+            instance_data,
+            snapshots,
+            args.animation,
+            args.iterations,
+        )
 
     result = {
         "instance": str(Path(args.instance).resolve()),
@@ -231,6 +257,8 @@ def solve(args: argparse.Namespace) -> dict:
         "improving_moves": improving_moves,
         "routes": [[int(node) for node in route] for route in environment.best_routes],
     }
+    if args.animation:
+        result["animation"] = str(Path(args.animation).resolve())
     if args.solution:
         reference_cost, _routes = parse_cvrp_answer(args.solution)
         result["reference_cost"] = float(reference_cost)
@@ -259,6 +287,15 @@ def parse_args() -> argparse.Namespace:
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     parser.add_argument("--output", default="results/generated/solution.json")
+    parser.add_argument(
+        "--animation",
+        help="optional destination for an animated GIF of the best solution",
+    )
+    parser.add_argument(
+        "--animation-every",
+        type=int,
+        help="capture one GIF frame every N iterations (default: about 60 frames)",
+    )
     return parser.parse_args()
 
 
@@ -266,6 +303,8 @@ def main() -> None:
     args = parse_args()
     if args.iterations <= 0:
         raise ValueError("--iterations must be positive")
+    if args.animation_every is not None and args.animation_every <= 0:
+        raise ValueError("--animation-every must be positive")
     result = solve(args)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
