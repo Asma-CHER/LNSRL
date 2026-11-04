@@ -15,7 +15,7 @@ CVRPLIB format with fewer than 200 customers.
 
 ![LNS-RL search iterations](assets/search_iterations.gif)
 
-*Evolution of the best-known routes during an LNS-RL run on CMT1.*
+*Evolution of the best-known routes during a 100-iteration optimized LNS-RL run on X-n143-k7 (142 customers).*
 
 ## Repository contents
 
