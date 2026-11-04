@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""Run the exact LNS-RL-V1 policy evaluated in the KES 2025 paper."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+
+from lib.ppo_1 import Agent
+from lib.vrp_helper_1 import get_distMat, parse_cvrp_answer, parse_cvrp_question
+from lib.vrp_helper_env import build_edge_index_near, build_edge_index_routes, vrp_env_sisr
+
+
+ROOT = Path(__file__).resolve().parent
+PAPER_CHECKPOINT = ROOT / "models" / "lns_rl_kes.pth"
+PAPER_CHECKPOINT_SHA256 = "ffcf8f83546a665c3cecd8d0b0a904a9d0ce3854a75dd12636fb3239b3efb664"
+
+
+def _write_array(data: np.ndarray, path: Path) -> None:
+    path.write_text("".join(" ".join(map(str, row)) + "\n" for row in data))
+
+
+def _write_distances(matrix: np.ndarray, path: Path) -> None:
+    line = ";".join(",".join(map(str, np.round(row, 4))) for row in matrix)
+    path.write_text(line + "\n")
+
+
+def _write_state(capacity: float, ruins: list[int], routes: list[list[int]], path: Path) -> None:
+    route_text = ";".join(",".join(map(str, route)) for route in routes)
+    path.write_text(f"{capacity}:{','.join(map(str, ruins))}:{route_text}\n")
+
+
+def _parse_java_output(output: str) -> tuple[float, list[list[int]]]:
+    pattern = re.compile(r"^\s*([-+0-9.eE]+):(.*)\s*$")
+    for raw_line in reversed(output.splitlines()):
+        match = pattern.match(raw_line)
+        if not match:
+            continue
+        routes = [
+            [int(node) for node in route.split(",") if node]
+            for route in match.group(2).split(";")
+            if route
+        ]
+        return float(match.group(1)), routes
+    raise RuntimeError(f"Java solver returned no parseable solution: {output!r}")
+
+
+def _compile_java() -> None:
+    java_dir = ROOT / "JAVA"
+    sources = [
+        java_dir / "ArrayIndexComparator.java",
+        java_dir / "RandomSolver.java",
+        java_dir / "SISRSolver.java",
+        java_dir / "Recreate.java",
+    ]
+    subprocess.run(
+        ["javac", "-classpath", str(java_dir), *(str(path) for path in sources)],
+        check=True,
+    )
+
+
+def _run_java(class_name: str, *arguments: object) -> str:
+    completed = subprocess.run(
+        ["java", "-classpath", str(ROOT / "JAVA"), class_name, *(str(arg) for arg in arguments)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def solve(args: argparse.Namespace) -> dict:
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    device = torch.device(args.device)
+
+    checkpoint = Path(args.model).resolve()
+    if checkpoint == PAPER_CHECKPOINT.resolve():
+        actual_hash = _sha256(checkpoint)
+        if actual_hash != PAPER_CHECKPOINT_SHA256:
+            raise RuntimeError(
+                "The bundled paper checkpoint has changed: "
+                f"expected {PAPER_CHECKPOINT_SHA256}, got {actual_hash}."
+            )
+
+    capacity, instance_data = parse_cvrp_question(args.instance)
+    n_nodes = len(instance_data)
+    n_customers = n_nodes - 1
+    if n_customers >= 200:
+        raise ValueError(
+            "The KES evaluation code only evaluated instances with fewer than "
+            f"200 customers; got {n_customers}."
+        )
+
+    n_ruins = int(math.ceil(max(math.sqrt(n_customers), 1.0) * 1.2 / args.anchors))
+    n_ruins_total = n_ruins * args.anchors
+    alpha_t = (args.final_temperature / args.initial_temperature) ** (1.0 / args.iterations)
+
+    _compile_java()
+    with tempfile.TemporaryDirectory(prefix="lns_rl_kes_") as temp_name:
+        temp_dir = Path(temp_name)
+        data_path = temp_dir / "data_0.txt"
+        state_path = temp_dir / "state.txt"
+        distance_path = temp_dir / "distances.txt"
+        _write_array(instance_data, data_path)
+
+        initial_output = _run_java(
+            "RandomSolver", data_path, int(capacity), 0, n_ruins_total
+        )
+        initial_distance, initial_routes = _parse_java_output(initial_output)
+        distance_matrix = get_distMat(instance_data)
+        _write_distances(distance_matrix, distance_path)
+
+        environment = vrp_env_sisr(
+            capacity,
+            instance_data,
+            distance_matrix,
+            initial_routes,
+            initial_distance,
+            args.initial_temperature,
+            alpha_t,
+        )
+
+        agent = Agent(
+            2e-5,
+            (0.9, 0.999),
+            0.99,
+            1,
+            0.2,
+            1,
+            11,
+            128,
+            256,
+            args.anchors,
+            device=device,
+        )
+        agent.load(str(checkpoint))
+        agent.policy_old.eval()
+
+        edge_near = build_edge_index_near([distance_matrix], 10)[0]
+        hidden = torch.zeros((1, 128), dtype=torch.float32, device=device)
+        previous_input = torch.zeros(
+            (1, n_ruins_total, 11), dtype=torch.float32, device=device
+        )
+        previous_ruins: list[int] = []
+        accepted_moves = 0
+        improving_moves = 0
+
+        for step in range(args.iterations):
+            embedding = environment.get_embedding_cvrp_metrics()
+            if step:
+                previous_input = torch.from_numpy(
+                    (embedding[previous_ruins] * float(was_accepted)).astype(np.float32)
+                ).unsqueeze(0).to(device)
+
+            graph = Data(
+                x=torch.from_numpy(embedding).float().to(device),
+                edge_index_r0=torch.from_numpy(
+                    build_edge_index_routes([environment.curr_routes], inverse=False)[0]
+                ).long().to(device),
+                edge_index_r1=torch.from_numpy(
+                    build_edge_index_routes([environment.curr_routes], inverse=True)[0]
+                ).long().to(device),
+                edge_index_n=torch.from_numpy(edge_near).long().to(device),
+                state_=hidden[0],
+                input_=previous_input[0],
+            )
+            batch = next(iter(DataLoader([graph], batch_size=1, shuffle=False)))
+            with torch.no_grad():
+                hidden, action_node, action_sisr, _node_dist, _sisr_dist = agent.policy_old.act(
+                    batch, n_nodes
+                )
+
+            coefficients = action_sisr[0, action_node[0]].detach().cpu().numpy()
+            previous_ruins = []
+            for anchor_index in range(args.anchors):
+                anchor = int(action_node[0, anchor_index].item()) + 1
+                selected = environment.get_ruins(
+                    anchor,
+                    float(coefficients[anchor_index]),
+                    n_ruins,
+                    ruined=previous_ruins,
+                )
+                previous_ruins.extend(selected)
+
+            _write_state(capacity, previous_ruins, environment.curr_routes, state_path)
+            recreated = _run_java(
+                "Recreate", str(temp_dir) + os.sep, state_path, distance_path
+            )
+            new_distance, new_routes = _parse_java_output(recreated)
+            was_accepted, was_improving, _reward = environment.sim_annealing(
+                new_distance, new_routes
+            )
+            accepted_moves += int(was_accepted)
+            improving_moves += int(was_improving)
+
+    result = {
+        "instance": str(Path(args.instance).resolve()),
+        "customers": n_customers,
+        "capacity": float(capacity),
+        "iterations": args.iterations,
+        "anchors": args.anchors,
+        "initial_temperature": args.initial_temperature,
+        "final_temperature": args.final_temperature,
+        "seed": args.seed,
+        "model": str(checkpoint),
+        "model_sha256": _sha256(checkpoint),
+        "initial_distance": float(initial_distance),
+        "best_distance": float(environment.best_dist),
+        "accepted_moves": accepted_moves,
+        "improving_moves": improving_moves,
+        "routes": [[int(node) for node in route] for route in environment.best_routes],
+    }
+    if args.solution:
+        reference_cost, _routes = parse_cvrp_answer(args.solution)
+        result["reference_cost"] = float(reference_cost)
+        result["gap_percent"] = (
+            100.0 * (float(environment.best_dist) - float(reference_cost)) / float(reference_cost)
+        )
+    return result
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--instance", required=True, help="CVRPLIB .vrp instance")
+    parser.add_argument("--solution", help="optional matching CVRPLIB .sol file")
+    parser.add_argument("--model", default=str(PAPER_CHECKPOINT))
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=5000,
+        help="LNS iterations; 5000 is the paper setting",
+    )
+    parser.add_argument("--anchors", type=int, default=2)
+    parser.add_argument("--initial-temperature", type=float, default=100.0)
+    parser.add_argument("--final-temperature", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument("--output", default="results/generated/solution.json")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.iterations <= 0:
+        raise ValueError("--iterations must be positive")
+    result = solve(args)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result, indent=2))
+    print(f"Saved {output}")
+
+
+if __name__ == "__main__":
+    main()
