@@ -1,4 +1,4 @@
-# LNS-RL-KES Optimized
+# LNS-RL Optimized
 
 This repository contains the implementation, trained policy, benchmark data,
 and evaluation results used for the LNS-RL experiments reported at KES 2025.
@@ -11,11 +11,42 @@ In particular, one persistent Java repair worker is reused throughout the
 search instead of starting a new JVM and exchanging files at every iteration.
 
 The release supports Capacitated Vehicle Routing Problem (CVRP) instances in
-CVRPLIB format with fewer than 200 customers.
+CVRPLIB format.
+
+## Associated paper
+
+**A Deep Reinforcement Learning-based Large Neighborhood Search for Capacitated
+Vehicle Routing Problems**
+
+Asma Cherrered, Ammar Oulamara, and Wahiba Ramdane Cherif-Khettaf
+
+Université de Lorraine, CNRS, LORIA, Nancy, France
+
+Published in *Procedia Computer Science*, volume 270, pages 1568–1577, as part
+of the 29th International Conference on Knowledge-Based and Intelligent
+Information & Engineering Systems (KES 2025), Osaka, Japan.
+
+- [Publication page](https://www.sciencedirect.com/science/article/pii/S1877050925029503)
+- [DOI: 10.1016/j.procs.2025.09.277](https://doi.org/10.1016/j.procs.2025.09.277)
 
 ![LNS-RL search iterations](assets/search_iterations.gif)
 
 *Evolution of the best-known routes during a 100-iteration optimized LNS-RL run on X-n143-k7 (142 customers).*
+
+## Original and optimized implementations
+
+The [`main`](https://github.com/Asma-CHER/LNSRL/tree/main) branch preserves the
+original paper-oriented execution path. This
+[`optimizer-runtime`](https://github.com/Asma-CHER/LNSRL/tree/optimizer-runtime)
+branch retains the same checkpoint, policy architecture, features, search
+parameters, and Java destroy/repair operators while optimizing their execution.
+
+The optimized runner keeps one Java repair worker alive, avoids per-iteration
+temporary-file exchange, caches static graph data, and removes the one-element
+PyTorch `DataLoader`. These changes improve runtime without changing the
+intended LNS-RL method. Because the Java implementation uses unseeded random
+operations, neither branch is expected to reproduce bit-for-bit identical
+search trajectories across independent executions.
 
 ## Repository contents
 
@@ -144,6 +175,51 @@ The Java initializer has its own random-number generator. Consequently,
 execution bitwise deterministic. Use multiple independent runs when
 regenerating aggregate results.
 
+## Reproducing the paper experiments
+
+First verify that the checkpoint, workbook, and all 41 benchmark pairs are the
+published artifacts:
+
+```bash
+python verify_release.py
+```
+
+The following command runs the paper configuration 10 times on every included
+instance. It performs 410 solver executions and may take several hours. Set
+`--device cuda` instead of `--device cpu` if a compatible CUDA environment is
+available.
+
+```bash
+mkdir -p results/generated/paper_reproduction
+
+for instance_path in data/paper_instances/*.vrp; do
+  instance_file="${instance_path##*/}"
+  instance_name="${instance_file%.vrp}"
+
+  for run in $(seq 0 9); do
+    python solve.py \
+      --instance "$instance_path" \
+      --solution "data/paper_solutions/${instance_name}.sol" \
+      --iterations 5000 \
+      --anchors 2 \
+      --initial-temperature 100 \
+      --final-temperature 1 \
+      --seed "$run" \
+      --device cpu \
+      --output "results/generated/paper_reproduction/${instance_name}_run_${run}.json"
+  done
+done
+```
+
+Each JSON file contains the best distance, reference cost, percentage gap,
+routes, and search statistics for one execution. The `--seed` option controls
+NumPy and PyTorch; the Java initialization and repair code remain stochastic.
+Consequently, reproduction should compare aggregate results across independent
+runs rather than expect identical routes from the historical evaluation.
+
+The unchanged historical tables are available in
+`results/Results_KES2025.xlsx`, with CSV exports in the same directory.
+
 ## Published artifacts
 
 The exact trained policy is stored at `models/lns_rl_kes.pth`. The unchanged
@@ -178,6 +254,26 @@ they are not solver parameters.
 ├── data/paper_instances/         # 41 benchmark instances
 ├── data/paper_solutions/         # Corresponding reference solutions
 └── results/                      # Published workbook and CSV exports
+```
+
+## Citation
+
+If you use this implementation or its published artifacts, please cite:
+
+```bibtex
+@article{cherrered2025deep,
+  title   = {A Deep Reinforcement Learning-based Large Neighborhood Search for
+             Capacitated Vehicle Routing Problems},
+  author  = {Cherrered, Asma and Oulamara, Ammar and
+             Cherif-Khettaf, Wahiba Ramdane},
+  journal = {Procedia Computer Science},
+  volume  = {270},
+  pages   = {1568--1577},
+  year    = {2025},
+  publisher = {Elsevier},
+  doi     = {10.1016/j.procs.2025.09.277},
+  url     = {https://doi.org/10.1016/j.procs.2025.09.277}
+}
 ```
 
 ## License
