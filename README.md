@@ -31,12 +31,12 @@ X-n143-k7 (142 customers).*
 
 ## Optimized implementation
 
-This `main` branch preserves the original paper-oriented execution path. A
-faster implementation is available in the
-[`optimizer-runtime`](https://github.com/Asma-CHER/LNSRL/tree/optimizer-runtime)
-branch. It retains the same checkpoint, policy architecture, features, search
-parameters, and Java destroy/repair operators while reducing execution
-overhead. See that branch for its implementation and validation details.
+This `Old-LNSRL` branch preserves the original paper-oriented execution path.
+The optimized implementation is available in the
+[`main`](https://github.com/Asma-CHER/LNSRL/tree/main) branch. It retains the
+same checkpoint, policy architecture, features, search parameters, and Java
+destroy/repair operators while reducing execution overhead. See that branch
+for its implementation and validation details.
 
 ## Repository contents
 
