@@ -23,6 +23,16 @@ ROUTE_COLORS = (
 )
 
 
+def _format_elapsed(seconds: float) -> str:
+    total_tenths = max(0, round(seconds * 10))
+    hours, remainder = divmod(total_tenths, 36_000)
+    minutes, remainder = divmod(remainder, 600)
+    whole_seconds, tenths = divmod(remainder, 10)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}.{tenths}"
+    return f"{minutes:02d}:{whole_seconds:02d}.{tenths}"
+
+
 def _font(size: int) -> ImageFont.ImageFont:
     try:
         return ImageFont.truetype("DejaVuSans.ttf", size=size)
@@ -61,6 +71,7 @@ def _frame(
     routes: Sequence[Sequence[int]],
     iteration: int,
     distance: float,
+    elapsed_seconds: float,
     total_iterations: int,
     width: int,
     height: int,
@@ -76,6 +87,12 @@ def _frame(
     draw.text(
         (28, 51),
         f"Iteration {iteration:,} / {total_iterations:,}",
+        fill="#334155",
+        font=body_font,
+    )
+    draw.text(
+        (305, 51),
+        f"Search time: {_format_elapsed(elapsed_seconds)}",
         fill="#334155",
         font=body_font,
     )
@@ -115,7 +132,7 @@ def _frame(
 
 def save_search_animation(
     instance_data: np.ndarray,
-    snapshots: Sequence[tuple[int, float, Sequence[Sequence[int]]]],
+    snapshots: Sequence[tuple[int, float, Sequence[Sequence[int]], float]],
     output: str | Path,
     total_iterations: int,
     *,
@@ -128,8 +145,17 @@ def save_search_animation(
         raise ValueError("At least one search snapshot is required")
 
     frames = [
-        _frame(instance_data, routes, iteration, distance, total_iterations, width, height)
-        for iteration, distance, routes in snapshots
+        _frame(
+            instance_data,
+            routes,
+            iteration,
+            distance,
+            elapsed_seconds,
+            total_iterations,
+            width,
+            height,
+        )
+        for iteration, distance, routes, elapsed_seconds in snapshots
     ]
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
