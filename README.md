@@ -31,7 +31,8 @@ Information & Engineering Systems (KES 2025), Osaka, Japan.
 
 ![LNS-RL search iterations](assets/search_iterations.gif)
 
-*Evolution of the best-known routes during a 100-iteration optimized LNS-RL run on X-n143-k7 (142 customers).*
+*Evolution of the best-known routes during a 1,000-iteration optimized LNS-RL
+run on X-n143-k7 (142 customers).*
 
 ## Original and optimized implementations
 
@@ -140,8 +141,10 @@ and model identifier. When a reference solution is provided, it also includes
 `reference_cost` and `gap_percent`.
 
 When `--animation` is supplied, the solver also creates an animated GIF showing
-how the best-known routes evolve over the sampled search iterations. Animation
-generation is optional and does not change the search decisions.
+how the best-known routes evolve over the sampled search iterations. Every
+frame reports the actual elapsed search time while retaining a fixed playback
+duration of 180 ms. Animation generation is optional and does not change the
+search decisions.
 
 ## Runtime optimization
 

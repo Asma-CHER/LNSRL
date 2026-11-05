@@ -11,6 +11,7 @@ import math
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -208,7 +209,7 @@ def solve(args: argparse.Namespace) -> dict:
         initial_distance, initial_routes = _parse_java_output(initial_output)
         animation_every = args.animation_every or max(1, args.iterations // 60)
         snapshots = [
-            (0, float(initial_distance), copy.deepcopy(initial_routes))
+            (0, float(initial_distance), copy.deepcopy(initial_routes), 0.0)
         ] if args.animation else []
         distance_matrix = get_distMat(instance_data)
         _write_distances(distance_matrix, distance_path)
@@ -251,6 +252,7 @@ def solve(args: argparse.Namespace) -> dict:
         improving_moves = 0
 
         with _RepairWorker(data_path, distance_path) as repair_worker:
+            search_started = time.perf_counter()
             for step in range(args.iterations):
                 embedding = environment.get_embedding_cvrp_metrics()
                 if step:
@@ -309,8 +311,10 @@ def solve(args: argparse.Namespace) -> dict:
                             completed_iterations,
                             float(environment.best_dist),
                             copy.deepcopy(environment.best_routes),
+                            time.perf_counter() - search_started,
                         )
                     )
+            search_time_seconds = time.perf_counter() - search_started
 
     if args.animation:
         save_search_animation(
@@ -336,6 +340,7 @@ def solve(args: argparse.Namespace) -> dict:
         "best_distance": float(environment.best_dist),
         "accepted_moves": accepted_moves,
         "improving_moves": improving_moves,
+        "search_time_seconds": search_time_seconds,
         "routes": [[int(node) for node in route] for route in environment.best_routes],
     }
     if args.animation:
