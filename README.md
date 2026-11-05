@@ -29,18 +29,17 @@ Information & Engineering Systems (KES 2025), Osaka, Japan.
 - [Publication page](https://www.sciencedirect.com/science/article/pii/S1877050925029503)
 - [DOI: 10.1016/j.procs.2025.09.277](https://doi.org/10.1016/j.procs.2025.09.277)
 
-![LNS-RL search iterations](assets/search_iterations.gif)
+![Optimized LNS-RL search iterations](assets/search_iterations_optimized.gif)
 
 *Evolution of the best-known routes during a 1,000-iteration optimized LNS-RL
 run on X-n143-k7 (142 customers).*
 
 ## Original and optimized implementations
 
-The [`main`](https://github.com/Asma-CHER/LNSRL/tree/main) branch preserves the
-original paper-oriented execution path. This
-[`optimizer-runtime`](https://github.com/Asma-CHER/LNSRL/tree/optimizer-runtime)
-branch retains the same checkpoint, policy architecture, features, search
-parameters, and Java destroy/repair operators while optimizing their execution.
+The [`Old-LNSRL`](https://github.com/Asma-CHER/LNSRL/tree/Old-LNSRL) branch
+preserves the original paper-oriented execution path. This `main` branch
+retains the same checkpoint, policy architecture, features, search parameters,
+and Java destroy/repair operators while optimizing their execution.
 
 The optimized runner keeps one Java repair worker alive, avoids per-iteration
 temporary-file exchange, caches static graph data, and removes the one-element
